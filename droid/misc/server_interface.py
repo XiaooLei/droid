@@ -43,7 +43,11 @@ class ServerInterface:
         self.server.kill_controller()
 
     def update_command(self, command, action_space="cartesian_velocity", gripper_action_space="velocity", blocking=False):
+        start_time = time.perf_counter()
         action_dict = self.server.update_command(command.tolist(), action_space, gripper_action_space, blocking)
+        rpc_ms = (time.perf_counter() - start_time) * 1000
+        timing = action_dict.setdefault("control_timing", {})
+        timing["client_update_command_rpc_ms"] = rpc_ms
         return action_dict
 
     def create_action_dict(self, command, action_space="cartesian_velocity", gripper_action_space=None):

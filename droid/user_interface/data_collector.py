@@ -15,6 +15,17 @@ dir_path = os.path.dirname(os.path.realpath(__file__))
 data_dir = os.path.join(dir_path, "../../data")
 
 
+def sanitize_traj_name(name):
+    safe_chars = []
+    for char in str(name).strip():
+        if char.isalnum() or char in ["-", "_"]:
+            safe_chars.append(char)
+        elif char.isspace() or char in ["/", "\\", ":", ";", ","]:
+            safe_chars.append("_")
+    safe_name = "".join(safe_chars).strip("_")
+    return safe_name or None
+
+
 class DataCollecter:
     def __init__(self, env, controller, policy=None, save_data=True, save_traj_dir=None):
         self.env = env
@@ -25,6 +36,7 @@ class DataCollecter:
         self.traj_running = False
         self.traj_saved = False
         self.obs_pointer = {}
+        self.read_cameras_during_control = True
 
         # Get Camera Info #
         self.cam_ids = list(env.camera_reader.camera_dict.keys())
@@ -70,11 +82,18 @@ class DataCollecter:
         self.env.camera_reader.set_trajectory_mode()
 
     def collect_trajectory(self, info=None, practice=False, reset_robot=True):
-        self.last_traj_name = time.asctime().replace(" ", "_")
+        timestamp_name = time.asctime().replace(" ", "_")
 
         if info is None:
             info = {}
+        trajectory_name = sanitize_traj_name(info.get("trajectory_name", ""))
+        self.last_traj_name = (
+            "{0}__{1}".format(trajectory_name, timestamp_name) if trajectory_name is not None else timestamp_name
+        )
         info["time"] = self.last_traj_name
+        info["timestamp_name"] = timestamp_name
+        if trajectory_name is not None:
+            info["trajectory_name"] = trajectory_name
         info["robot_serial_number"] = "{0}-{1}".format(robot_type, robot_serial_number)
         info["version_number"] = droid_version
         if hasattr(self, "control_source"):
@@ -106,6 +125,7 @@ class DataCollecter:
             recording_folderpath=recording_folderpath,
             save_filepath=save_filepath,
             wait_for_controller=True,
+            read_cameras=self.read_cameras_during_control,
         )
         self.traj_running = False
         self.obs_pointer = {}

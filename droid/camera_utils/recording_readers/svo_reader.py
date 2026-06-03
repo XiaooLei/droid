@@ -28,6 +28,7 @@ class SVOReader:
         # Set SVO path for playback
         init_parameters = sl.InitParameters()
         init_parameters.camera_image_flip = sl.FLIP_MODE.OFF
+        init_parameters.depth_mode = sl.DEPTH_MODE.NONE
         init_parameters.set_from_svo_file(filepath)
 
         # Open the ZED
@@ -142,6 +143,18 @@ class SVOReader:
         if return_timestamp:
             return data_dict, received_time
         return data_dict
+
+    def read_camera_at_timestamp(self, correct_timestamp):
+        while True:
+            result = self.read_camera(return_timestamp=True)
+            if result is None:
+                return None
+            data_dict, received_time = result
+            if received_time == correct_timestamp:
+                return data_dict
+            if received_time is not None and received_time > correct_timestamp:
+                print("Timestamps did not match...")
+                return None
 
     def disable_camera(self):
         if hasattr(self, "_cam"):

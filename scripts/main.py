@@ -43,6 +43,11 @@ parser.add_argument("--master-gripper-open", type=float, default=3.446855)
 parser.add_argument("--master-gripper-closed", type=float, default=2.523398)
 parser.add_argument("--master-gripper-open-command", type=float, default=0.0)
 parser.add_argument("--master-gripper-closed-command", type=float, default=1.0)
+parser.add_argument(
+    "--master-sync-live-cameras",
+    action="store_true",
+    help="Read live camera images synchronously in the master-arm control loop.",
+)
 
 
 args = parser.parse_args()
@@ -78,6 +83,7 @@ if args.control_source == "master":
     )
     data_collector = DataCollecter(env=env, controller=controller)
     data_collector.control_source = "master"
+    data_collector.read_cameras_during_control = args.master_sync_live_cameras
     user_interface = RobotGUI(robot=data_collector, right_controller=True, control_source="master")
 else:
     env = RobotEnv()
@@ -86,4 +92,3 @@ else:
     data_collector = DataCollecter(env=env, controller=controller)
     data_collector.control_source = "vr"
     user_interface = RobotGUI(robot=data_collector, right_controller=right_controller, control_source="vr")
-

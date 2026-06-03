@@ -38,16 +38,29 @@ class FrankaRobot:
         self._max_gripper_width = self._gripper.metadata.max_width
         self._ik_solver = RobotIKSolver()
         self._controller_not_loaded = False
+        self._last_gripper_target = None
+        self._gripper_deadband = float(os.environ.get("DROID_GRIPPER_DEADBAND", "0.01"))
 
     def kill_controller(self):
         self._robot_process.kill()
         self._gripper_process.kill()
 
     def update_command(self, command, action_space="cartesian_velocity", gripper_action_space=None, blocking=False):
+        timing = {}
+        start_time = time.perf_counter()
         action_dict = self.create_action_dict(command, action_space=action_space, gripper_action_space=gripper_action_space)
+        timing["create_action_dict_ms"] = (time.perf_counter() - start_time) * 1000
 
+        joint_start = time.perf_counter()
         self.update_joints(action_dict["joint_position"], velocity=False, blocking=blocking)
-        self.update_gripper(action_dict["gripper_position"], velocity=False, blocking=blocking)
+        timing["update_joints_ms"] = (time.perf_counter() - joint_start) * 1000
+
+        gripper_start = time.perf_counter()
+        gripper_command_sent = self.update_gripper(action_dict["gripper_position"], velocity=False, blocking=blocking)
+        timing["update_gripper_ms"] = (time.perf_counter() - gripper_start) * 1000
+        timing["gripper_command_sent"] = gripper_command_sent
+        timing["total_server_update_command_ms"] = (time.perf_counter() - start_time) * 1000
+        action_dict["control_timing"] = timing
 
         return action_dict
 
@@ -120,7 +133,11 @@ class FrankaRobot:
             command = gripper_delta + self.get_gripper_position()
 
         command = float(np.clip(command, 0, 1))
+        if self._last_gripper_target is not None and abs(command - self._last_gripper_target) < self._gripper_deadband:
+            return False
         self._gripper.goto(width=self._max_gripper_width * (1 - command), speed=0.05, force=0.1, blocking=blocking)
+        self._last_gripper_target = command
+        return True
 
     def add_noise_to_joints(self, original_joints, cartesian_noise):
         original_joints = torch.Tensor(original_joints)

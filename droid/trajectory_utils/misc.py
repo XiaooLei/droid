@@ -29,6 +29,7 @@ def collect_trajectory(
     recording_folderpath=False,
     randomize_reset=False,
     reset_robot=True,
+    read_cameras=True,
 ):
     """
     Collects a robot trajectory.
@@ -58,6 +59,14 @@ def collect_trajectory(
         traj_writer = TrajectoryWriter(save_filepath, metadata=metadata, save_images=save_images)
     if recording_folderpath:
         env.camera_reader.start_recording(recording_folderpath)
+    async_camera_reading = recording_folderpath and not read_cameras
+    if async_camera_reading:
+        env.camera_reader.start_async_reading(include_images=False)
+        for _ in range(50):
+            _, camera_timestamp = env.camera_reader.get_latest_camera_reading()
+            if camera_timestamp:
+                break
+            time.sleep(0.02)
 
     # Prepare For Trajectory #
     num_steps = 0
@@ -72,7 +81,7 @@ def collect_trajectory(
         control_timestamps = {"step_start": time_ms()}
 
         # Get Observation #
-        obs = env.get_observation()
+        obs = env.get_observation(read_cameras=read_cameras)
         if obs_pointer is not None:
             obs_pointer.update(obs)
         obs["controller_info"] = controller_info
@@ -86,12 +95,9 @@ def collect_trajectory(
             action = policy.forward(obs)
             controller_action_info = {}
 
-        # Regularize Control Frequency #
+        # Regularize control frequency after the robot command is sent so the
+        # full observation-policy-control cycle is included in the period.
         control_timestamps["sleep_start"] = time_ms()
-        comp_time = time_ms() - control_timestamps["step_start"]
-        sleep_left = (1 / env.control_hz) - (comp_time / 1000)
-        if sleep_left > 0:
-            time.sleep(sleep_left)
 
         # Moniter Control Frequency #
         # moniter_control_frequency = True
@@ -131,11 +137,18 @@ def collect_trajectory(
 
         # Close Files And Return #
         if end_traj:
+            if async_camera_reading:
+                env.camera_reader.stop_async_reading()
             if recording_folderpath:
                 env.camera_reader.stop_recording()
             if save_filepath:
                 traj_writer.close(metadata=controller_info)
             return controller_info
+
+        comp_time = time_ms() - control_timestamps["step_start"]
+        sleep_left = (1 / env.control_hz) - (comp_time / 1000)
+        if sleep_left > 0:
+            time.sleep(sleep_left)
 
 
 def calibrate_camera(
@@ -374,6 +387,7 @@ def load_trajectory(
     remove_skipped_steps=False,
     num_samples_per_traj=None,
     num_samples_per_traj_coeff=1.5,
+    ignore_camera_timestamps=False,
 ):
     read_hdf5_images = read_cameras and (recording_folderpath is None)
     read_recording_folderpath = read_cameras and (recording_folderpath is not None)
@@ -402,7 +416,7 @@ def load_trajectory(
 
         # If Applicable, Get Recorded Data #
         if read_recording_folderpath:
-            timestamp_dict = timestep["observation"]["timestamp"]["cameras"]
+            timestamp_dict = {} if ignore_camera_timestamps else timestep["observation"]["timestamp"]["cameras"]
             camera_type_dict = {
                 k: camera_type_to_string_dict[v] for k, v in timestep["observation"]["camera_type"].items()
             }

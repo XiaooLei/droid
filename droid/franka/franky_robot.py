@@ -45,6 +45,19 @@ class FrankyRobot:
         self._joint_position_lock = threading.Lock()
         self._gripper_width = 0.0  # Current gripper position (0-1 normalized)
         self._max_gripper_width = 0.085  # Default for Robotiq 2F
+        self._last_gripper_target = None
+        self._gripper_deadband = float(os.environ.get("DROID_GRIPPER_DEADBAND", "0.01"))
+        self._gripper_lock = threading.Lock()
+        self._gripper_condition = threading.Condition(self._gripper_lock)
+        self._gripper_worker_stop = threading.Event()
+        self._gripper_worker_thread = None
+        self._pending_gripper_target = None
+        self._latest_requested_gripper_target = None
+        self._gripper_busy = False
+        self._gripper_submit_count = 0
+        self._gripper_send_count = 0
+        self._gripper_overwrite_count = 0
+        self._gripper_error_count = 0
 
     def launch_controller(self):
         """No-op for compatibility."""
@@ -67,6 +80,9 @@ class FrankyRobot:
                 self._gripper.calibrate_speed()
                 time.sleep(1)
                 self._gripper_width = 1.0  # normalized position (1 = open)
+                self._last_gripper_target = self._gripper_width
+                self._latest_requested_gripper_target = self._gripper_width
+                self._start_gripper_worker()
             except Exception as e:
                 print(f"Warning: Gripper not available ({e}). Continuing without gripper.")
                 self._gripper = None
@@ -84,6 +100,48 @@ class FrankyRobot:
         self._stop_control.set()
         if self._control_thread and self._control_thread.is_alive():
             self._control_thread.join(timeout=2)
+        self._stop_gripper_worker()
+
+    def _start_gripper_worker(self):
+        if self._gripper_worker_thread is not None and self._gripper_worker_thread.is_alive():
+            return
+        self._gripper_worker_stop.clear()
+        self._gripper_worker_thread = threading.Thread(target=self._gripper_worker_loop, daemon=True)
+        self._gripper_worker_thread.start()
+
+    def _stop_gripper_worker(self):
+        self._gripper_worker_stop.set()
+        with self._gripper_condition:
+            self._gripper_condition.notify_all()
+        if self._gripper_worker_thread is not None:
+            self._gripper_worker_thread.join(timeout=2)
+            self._gripper_worker_thread = None
+
+    def _gripper_worker_loop(self):
+        while not self._gripper_worker_stop.is_set():
+            with self._gripper_condition:
+                while self._pending_gripper_target is None and not self._gripper_worker_stop.is_set():
+                    self._gripper_condition.wait(timeout=0.1)
+                if self._gripper_worker_stop.is_set():
+                    break
+                target_pos = self._pending_gripper_target
+                self._pending_gripper_target = None
+                self._gripper_busy = True
+
+            target_bits = int(target_pos * 255)
+            try:
+                self._gripper.realTimeMove(target_bits)
+                with self._gripper_condition:
+                    self._gripper_width = target_pos
+                    self._last_gripper_target = target_pos
+                    self._gripper_send_count += 1
+            except Exception as e:
+                with self._gripper_condition:
+                    self._gripper_error_count += 1
+                print(f"Error updating gripper: {e}")
+            finally:
+                with self._gripper_condition:
+                    self._gripper_busy = False
 
     def read_once(self):
         """Read robot state (simplified for Franky compatibility)."""
@@ -190,38 +248,85 @@ class FrankyRobot:
             thread.start()
 
     def update_gripper(self, command, velocity=True, blocking=False):
-        """Update gripper position using pyRobotiqGripper."""
+        """Submit a gripper target.
+
+        Non-blocking calls use a single-slot latest-target worker so Robotiq
+        stalls cannot block the arm control loop or build up stale commands.
+        """
         if self._gripper is None:
             print("Warning: Gripper not initialized")
-            return
+            return False
+
+        with self._gripper_condition:
+            current_gripper_width = self._latest_requested_gripper_target
+            if current_gripper_width is None:
+                current_gripper_width = self._gripper_width
 
         if velocity:
             gripper_delta = self._ik_solver.gripper_velocity_to_delta(command)
-            target_pos = self._gripper_width + gripper_delta
+            target_pos = current_gripper_width + gripper_delta
             target_pos = float(np.clip(target_pos, 0, 1))
         else:
             # DROID convention: 0=open, 1=closed.
             target_pos = float(np.clip(command, 0, 1))
 
-        # Convert normalized closed amount (0-1) to Robotiq command (0-255).
+        with self._gripper_condition:
+            reference_target = self._latest_requested_gripper_target
+            if reference_target is None:
+                reference_target = self._last_gripper_target
+            if reference_target is not None and abs(target_pos - reference_target) < self._gripper_deadband:
+                return False
+
+            if blocking:
+                self._pending_gripper_target = None
+                self._latest_requested_gripper_target = target_pos
+            else:
+                if self._pending_gripper_target is not None:
+                    self._gripper_overwrite_count += 1
+                self._pending_gripper_target = target_pos
+                self._latest_requested_gripper_target = target_pos
+                self._gripper_submit_count += 1
+                self._gripper_condition.notify()
+                return True
+
         target_bits = int(target_pos * 255)
-
-
         try:
             self._gripper.realTimeMove(target_bits)
-            self._gripper_width = target_pos
+            with self._gripper_condition:
+                self._gripper_width = target_pos
+                self._last_gripper_target = target_pos
+                self._gripper_send_count += 1
+            return True
         except Exception as e:
+            with self._gripper_condition:
+                self._gripper_error_count += 1
             print(f"Error updating gripper: {e}")
+            return False
+
+    def get_gripper_async_status(self):
+        with self._gripper_condition:
+            return {
+                "gripper_async_busy": self._gripper_busy,
+                "gripper_async_has_pending": self._pending_gripper_target is not None,
+                "gripper_async_submit_count": self._gripper_submit_count,
+                "gripper_async_send_count": self._gripper_send_count,
+                "gripper_async_overwrite_count": self._gripper_overwrite_count,
+                "gripper_async_error_count": self._gripper_error_count,
+            }
 
     def update_command(self, command, action_space="cartesian_velocity", gripper_action_space="velocity", blocking=False):
         """Main entry point for RobotEnv.update_robot() - maps action to robot command."""
+        timing = {}
+        start_time = time.perf_counter()
         action_dict = self.create_action_dict(
             action=np.array(command),
             action_space=action_space,
             gripper_action_space=gripper_action_space
         )
+        timing["create_action_dict_ms"] = (time.perf_counter() - start_time) * 1000
 
         # Execute based on action_space type
+        joint_start = time.perf_counter()
         if "cartesian" in action_space:
             joint_position = action_dict.get("joint_position")
             if joint_position is not None:
@@ -234,11 +339,19 @@ class FrankyRobot:
                 self.update_joints(joint_position, velocity=False, blocking=blocking)
             else:
                 print(f"[FRANKY] update_command: action_space={action_space}, joint_position=None")
+        timing["update_joints_ms"] = (time.perf_counter() - joint_start) * 1000
 
         # Update gripper
+        gripper_start = time.perf_counter()
+        gripper_command_sent = False
         gripper_pos = action_dict.get("gripper_position")
         if gripper_pos is not None:
-            self.update_gripper(gripper_pos, velocity=False, blocking=blocking)
+            gripper_command_sent = self.update_gripper(gripper_pos, velocity=False, blocking=blocking)
+        timing["update_gripper_ms"] = (time.perf_counter() - gripper_start) * 1000
+        timing["gripper_command_sent"] = gripper_command_sent
+        timing.update(self.get_gripper_async_status())
+        timing["total_server_update_command_ms"] = (time.perf_counter() - start_time) * 1000
+        action_dict["control_timing"] = timing
 
         # Convert numpy arrays to lists for zerorpc serialization
         return self._convert_action_dict(action_dict)

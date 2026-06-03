@@ -1,6 +1,7 @@
 import glob
 import random
 from collections import defaultdict
+from pathlib import Path
 
 from droid.camera_utils.info import get_camera_type
 from droid.camera_utils.recording_readers.mp4_reader import MP4Reader
@@ -13,17 +14,19 @@ class RecordedMultiCameraWrapper:
         self.camera_kwargs = camera_kwargs
 
         # Open Camera Readers #
-        svo_filepaths = glob.glob(recording_folderpath + "/*.svo")
+        svo_filepaths = glob.glob(recording_folderpath + "/*.svo") + glob.glob(recording_folderpath + "/*.svo2")
         mp4_filepaths = glob.glob(recording_folderpath + "/*.mp4")
         all_filepaths = svo_filepaths + mp4_filepaths
 
         self.camera_dict = {}
+        self._last_timestamp_by_camera = {}
+        self._last_data_by_camera = {}
         for f in all_filepaths:
-            serial_number = f.split("/")[-1][:-4]
+            serial_number = Path(f).stem
             cam_type = get_camera_type(serial_number)
             camera_kwargs.get(cam_type, {})
 
-            if f.endswith(".svo"):
+            if f.endswith(".svo") or f.endswith(".svo2"):
                 Reader = SVOReader
             elif f.endswith(".mp4"):
                 Reader = MP4Reader
@@ -45,10 +48,17 @@ class RecordedMultiCameraWrapper:
             self.camera_dict[cam_id].set_reading_parameters(**curr_cam_kwargs)
 
             timestamp = timestamp_dict.get(cam_id + "_frame_received", None)
-            if index is not None:
-                self.camera_dict[cam_id].set_frame_index(index)
-
-            data_dict = self.camera_dict[cam_id].read_camera(correct_timestamp=timestamp)
+            if timestamp is not None:
+                if self._last_timestamp_by_camera.get(cam_id) == timestamp:
+                    data_dict = self._last_data_by_camera.get(cam_id)
+                else:
+                    data_dict = self.camera_dict[cam_id].read_camera_at_timestamp(timestamp)
+                    self._last_timestamp_by_camera[cam_id] = timestamp
+                    self._last_data_by_camera[cam_id] = data_dict
+            else:
+                if index is not None:
+                    self.camera_dict[cam_id].set_frame_index(index)
+                data_dict = self.camera_dict[cam_id].read_camera()
 
             # Process Returned Data #
             if data_dict is None:

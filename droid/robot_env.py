@@ -97,8 +97,8 @@ class RobotEnv(gym.Env):
             action_info["joint_velocity"] = action_info["joint_velocity"][:7]
         return action_info
 
-    def read_cameras(self):
-        return self.camera_reader.read_cameras()
+    def read_cameras(self, include_images=True):
+        return self.camera_reader.read_cameras(include_images=include_images)
 
     def get_state(self):
         read_start = time_ms()
@@ -118,7 +118,7 @@ class RobotEnv(gym.Env):
             extrinsics[cam_id] = change_pose_frame(extrinsics[cam_id], gripper_pose)
         return extrinsics
 
-    def get_observation(self):
+    def get_observation(self, read_cameras=True):
         obs_dict = {"timestamp": {}}
 
         # Robot State #
@@ -127,7 +127,11 @@ class RobotEnv(gym.Env):
         obs_dict["timestamp"]["robot_state"] = timestamp_dict
 
         # Camera Readings #
-        camera_obs, camera_timestamp = self.read_cameras()
+        if read_cameras:
+            camera_obs, camera_timestamp = self.read_cameras()
+        else:
+            camera_obs, camera_timestamp = self.camera_reader.get_latest_camera_reading()
+            camera_timestamp["live_read_skipped"] = True
         obs_dict.update(camera_obs)
         obs_dict["timestamp"]["cameras"] = camera_timestamp
 

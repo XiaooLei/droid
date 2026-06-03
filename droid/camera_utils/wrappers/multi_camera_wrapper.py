@@ -1,5 +1,7 @@
 import os
 import random
+import threading
+import time
 from collections import defaultdict
 
 from droid.camera_utils.camera_readers.zed_camera import gather_zed_cameras
@@ -19,6 +21,11 @@ class MultiCameraWrapper:
             self.camera_dict[cam_id].set_reading_parameters(**curr_cam_kwargs)
 
         # Launch Camera #
+        self._latest_camera_timestamp = {}
+        self._latest_camera_obs = defaultdict(dict)
+        self._latest_lock = threading.Lock()
+        self._async_running = False
+        self._async_thread = None
         self.set_trajectory_mode()
 
     ### Calibration Functions ###
@@ -72,7 +79,47 @@ class MultiCameraWrapper:
             cam.stop_recording()
 
     ### Basic Camera Functions ###
-    def read_cameras(self):
+    def start_async_reading(self, include_images=False, frequency=None):
+        if self._async_running:
+            return
+
+        self._async_running = True
+        period_s = None if frequency is None or frequency <= 0 else 1.0 / frequency
+
+        def async_loop():
+            next_tick = time.monotonic()
+            while self._async_running:
+                obs, timestamp = self.read_cameras(include_images=include_images)
+                with self._latest_lock:
+                    self._latest_camera_obs = obs
+                    self._latest_camera_timestamp = timestamp
+
+                if period_s is None:
+                    continue
+                next_tick += period_s
+                sleep_s = next_tick - time.monotonic()
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
+                else:
+                    next_tick = time.monotonic()
+
+        self._async_thread = threading.Thread(target=async_loop, daemon=True)
+        self._async_thread.start()
+
+    def stop_async_reading(self):
+        self._async_running = False
+        if self._async_thread is not None:
+            self._async_thread.join(timeout=2)
+            self._async_thread = None
+
+    def get_latest_camera_reading(self):
+        with self._latest_lock:
+            obs = defaultdict(dict)
+            for key, value in self._latest_camera_obs.items():
+                obs[key].update(value)
+            return obs, dict(self._latest_camera_timestamp)
+
+    def read_cameras(self, include_images=True):
         full_obs_dict = defaultdict(dict)
         full_timestamp_dict = {}
 
@@ -83,7 +130,7 @@ class MultiCameraWrapper:
         for cam_id in all_cam_ids:
             if not self.camera_dict[cam_id].is_running():
                 continue
-            data_dict, timestamp_dict = self.camera_dict[cam_id].read_camera()
+            data_dict, timestamp_dict = self.camera_dict[cam_id].read_camera(include_images=include_images)
 
             for key in data_dict:
                 full_obs_dict[key].update(data_dict[key])
@@ -92,5 +139,6 @@ class MultiCameraWrapper:
         return full_obs_dict, full_timestamp_dict
 
     def disable_cameras(self):
+        self.stop_async_reading()
         for camera in self.camera_dict.values():
             camera.disable_camera()

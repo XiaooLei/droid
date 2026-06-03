@@ -111,6 +111,18 @@ class MP4Reader:
             return data_dict, received_time
         return data_dict
 
+    def read_camera_at_timestamp(self, correct_timestamp):
+        while True:
+            result = self.read_camera(return_timestamp=True)
+            if result is None:
+                return None
+            data_dict, received_time = result
+            if received_time == correct_timestamp:
+                return data_dict
+            if received_time is not None and received_time > correct_timestamp:
+                print("Timestamps did not match...")
+                return None
+
     def disable_camera(self):
         if hasattr(self, "_mp4_reader"):
             self._mp4_reader.release()

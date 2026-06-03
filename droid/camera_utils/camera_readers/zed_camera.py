@@ -204,7 +204,7 @@ class ZedCamera:
             return frame
         return self.resize_func(frame, self.resizer_resolution)
 
-    def read_camera(self):
+    def read_camera(self, include_images=True):
         # Skip if Read Unnecesary #
         if self.skip_reading:
             return {}, {}
@@ -224,7 +224,7 @@ class ZedCamera:
         # Return Data #
         data_dict = {}
 
-        if self.image:
+        if self.image and include_images:
             if self.concatenate_images:
                 self._cam.retrieve_image(self._sbs_img, sl.VIEW.SIDE_BY_SIDE, resolution=self.zed_resolution)
                 data_dict["image"] = {self.serial_number: self._process_frame(self._sbs_img)}
