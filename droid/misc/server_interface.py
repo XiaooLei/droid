@@ -42,6 +42,12 @@ class ServerInterface:
     def kill_controller(self):
         self.server.kill_controller()
 
+    def recover_robot(self):
+        return self.server.recover_robot()
+
+    def get_connection_status(self):
+        return self.server.get_connection_status()
+
     def update_command(self, command, action_space="cartesian_velocity", gripper_action_space="velocity", blocking=False):
         start_time = time.perf_counter()
         action_dict = self.server.update_command(command.tolist(), action_space, gripper_action_space, blocking)

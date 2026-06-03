@@ -38,6 +38,10 @@ class FrankyRobot:
 
         self._ik_solver = RobotIKSolver()
         self._robot: Optional[franky.Robot] = None
+        self._robot_lock = threading.RLock()
+        self._last_robot_error = None
+        self._robot_recover_count = 0
+        self._robot_reconnect_count = 0
         self._gripper: Optional[object] = None
         self._control_thread: Optional[threading.Thread] = None
         self._stop_control = threading.Event()
@@ -65,9 +69,8 @@ class FrankyRobot:
 
     def launch_robot(self):
         """Initialize robot and gripper connection via Franky."""
-        if self._robot is None:
-            self._robot = franky.Robot(self.ROBOT_IP)
-            self._robot.relative_dynamics_factor = 0.1  # Start with 10% speed
+        with self._robot_lock:
+            self._connect_robot_locked()
 
         # Gripper initialization using pyRobotiqGripper
         gripper_com_port = os.environ.get("GRIPPER_COM_PORT", "/dev/ttyUSB0")
@@ -87,13 +90,95 @@ class FrankyRobot:
                 print(f"Warning: Gripper not available ({e}). Continuing without gripper.")
                 self._gripper = None
 
-        # Read initial state
+        print(f"Franky robot initialized: IP={self.ROBOT_IP}")
+
+    def establish_connection(self):
+        """Compatibility RPC: reconnect to the robot without restarting the server."""
+        self.launch_robot()
+
+    def _connect_robot_locked(self, force=False):
+        if self._robot is not None and not force:
+            try:
+                state = self._robot.state
+                with self._joint_position_lock:
+                    self._current_joint_positions = np.array(state.q)
+                self._last_robot_error = None
+                return
+            except Exception as err:
+                print(f"[FRANKY] Existing robot connection failed health check: {err}")
+                force = True
+
+        if force:
+            self._robot_reconnect_count += 1
+            self._robot = None
+
+        self._robot = franky.Robot(self.ROBOT_IP)
+        self._robot.relative_dynamics_factor = 0.1  # Start with 10% speed
+
         state = self._robot.state
         with self._joint_position_lock:
             self._current_joint_positions = np.array(state.q)
 
         self._controller_not_loaded = False
-        print(f"Franky robot initialized: IP={self.ROBOT_IP}")
+        self._last_robot_error = None
+
+    def _recover_robot_locked(self, reason=None):
+        """Recover Franka faults first, then reconnect if the object is stale."""
+        self._last_robot_error = None if reason is None else str(reason)
+        self._robot_recover_count += 1
+
+        if self._robot is None:
+            self._connect_robot_locked(force=True)
+            return
+
+        try:
+            print(f"[FRANKY] Recovering robot after error: {reason}")
+            self._robot.recover_from_errors()
+            time.sleep(0.2)
+            state = self._robot.state
+            with self._joint_position_lock:
+                self._current_joint_positions = np.array(state.q)
+            self._last_robot_error = None
+            return
+        except Exception as recover_error:
+            print(f"[FRANKY] recover_from_errors failed, reconnecting: {recover_error}")
+            self._last_robot_error = str(recover_error)
+            self._connect_robot_locked(force=True)
+
+    def _run_robot_call(self, name, func, retries=1):
+        last_error = None
+        for attempt in range(retries + 1):
+            with self._robot_lock:
+                try:
+                    self._connect_robot_locked()
+                    return func()
+                except Exception as err:
+                    last_error = err
+                    if attempt >= retries:
+                        self._last_robot_error = str(err)
+                        raise
+                    self._recover_robot_locked(reason=f"{name}: {type(err).__name__}: {err}")
+        raise last_error
+
+    def recover_robot(self):
+        """Manual RPC recovery hook for PC2/GUI without restarting the NUC process."""
+        with self._robot_lock:
+            self._recover_robot_locked(reason="manual recover_robot")
+            state = self._robot.state
+            return {
+                "ok": True,
+                "joint_positions": list(state.q),
+                "recover_count": self._robot_recover_count,
+                "reconnect_count": self._robot_reconnect_count,
+            }
+
+    def get_connection_status(self):
+        return {
+            "robot_connected": self._robot is not None,
+            "last_robot_error": self._last_robot_error,
+            "recover_count": self._robot_recover_count,
+            "reconnect_count": self._robot_reconnect_count,
+        }
 
     def kill_controller(self):
         """Stop any ongoing control."""
@@ -145,49 +230,52 @@ class FrankyRobot:
 
     def read_once(self):
         """Read robot state (simplified for Franky compatibility)."""
-        if self._robot is None:
-            raise RuntimeError("Robot not initialized. Call launch_robot() first.")
-        state = self._robot.state
-        return {
-            "q": list(state.q),
-            "dq": list(state.dq),
-            "O_T_EE": list(state.O_T_EE),
-            "tau_J": list(state.tau_J) if hasattr(state, 'tau_J') else [0.0] * 7,
-            "time": state.time if hasattr(state, 'time') else 0,
-        }
+        def read():
+            state = self._robot.state
+            return {
+                "q": list(state.q),
+                "dq": list(state.dq),
+                "O_T_EE": list(state.O_T_EE),
+                "tau_J": list(state.tau_J) if hasattr(state, 'tau_J') else [0.0] * 7,
+                "time": state.time if hasattr(state, 'time') else 0,
+            }
+        return self._run_robot_call("read_once", read, retries=1)
 
     def _enter_joint_control_mode(self):
         """Enter joint position control mode - must be called before motion."""
-        # Recover from any errors
-        try:
-            self._robot.recover_from_errors()
-        except:
-            pass
+        def enter():
+            try:
+                self._robot.recover_from_errors()
+            except Exception:
+                pass
 
-        # Stop any current motion
-        self._robot.stop()
+            self._robot.stop()
 
-        # Wait for velocities to settle
-        for _ in range(40):  # Wait up to 2 seconds
-            dq = np.abs(np.array(self._robot.state.dq))
-            if dq.max() < 0.005:
-                break
-            time.sleep(0.05)
+            for _ in range(40):  # Wait up to 2 seconds
+                dq = np.abs(np.array(self._robot.state.dq))
+                if dq.max() < 0.005:
+                    break
+                time.sleep(0.05)
 
-        # Enter joint position control mode with explicit stop
-        try:
-            self._robot.move(franky.JointStopMotion())
-        except:
-            pass
+            try:
+                self._robot.move(franky.JointStopMotion())
+            except Exception:
+                pass
 
-        # Wait longer for control to stabilize
-        time.sleep(1.0)
+            time.sleep(1.0)
+
+        return self._run_robot_call("_enter_joint_control_mode", enter, retries=1)
+
+    def _move_to_joint_positions_once_locked(self, positions, speed_factor):
+        self._robot.relative_dynamics_factor = speed_factor
+        motion = franky.JointMotion(positions.tolist())
+        self._robot.move(motion, asynchronous=True)
+        return {
+            "joint_positions": positions,
+        }
 
     def move_to_joint_positions(self, positions, speed_factor=0.1, timeout=30):
         """Move to joint positions using Franky."""
-        if self._robot is None:
-            raise RuntimeError("Robot not initialized")
-
         positions = np.array(positions)
         # Handle 8-element action (7 joints + 1 gripper)
         if len(positions) == 8:
@@ -198,21 +286,19 @@ class FrankyRobot:
         if len(positions) != 7:
             raise ValueError(f"Expected 7 joint positions, got {len(positions)}")
 
-        # Set speed
-        self._robot.relative_dynamics_factor = speed_factor
-
-        # Use JointMotion for smooth trajectory (ruckig handles this internally)
-        motion = franky.JointMotion(positions.tolist())
-
-        # Execute motion (asynchronous so new motions preempt old ones automatically)
         try:
-            self._robot.move(motion, asynchronous=True)
+            self._run_robot_call(
+                "move_to_joint_positions",
+                lambda: self._move_to_joint_positions_once_locked(positions, speed_factor),
+                retries=1,
+            )
         except franky.ControlException as e:
             if "Reflex" in str(e):
                 print(f"[FRANKY] Reflex detected, recovering...")
                 try:
-                    self._robot.recover_from_errors()
-                    self._robot.move(motion, asynchronous=True)
+                    with self._robot_lock:
+                        self._recover_robot_locked(reason=e)
+                        self._move_to_joint_positions_once_locked(positions, speed_factor)
                     print(f"[FRANKY] Recovery successful.")
                 except Exception as re:
                     print(f"[FRANKY] Recovery failed: {re}")
@@ -244,7 +330,7 @@ class FrankyRobot:
         if blocking:
             self.move_to_joint_positions(target)
         else:
-            thread = threading.Thread(target=self.move_to_joint_positions, args=(target,))
+            thread = threading.Thread(target=self.move_to_joint_positions, args=(target,), daemon=True)
             thread.start()
 
     def update_gripper(self, command, velocity=True, blocking=False):
@@ -375,14 +461,11 @@ class FrankyRobot:
         with self._joint_position_lock:
             if self._current_joint_positions is not None:
                 return list(self._current_joint_positions)
-            else:
-                state = self._robot.state
-                return list(state.q)
+        return self._run_robot_call("get_joint_positions", lambda: list(self._robot.state.q), retries=1)
 
     def get_joint_velocities(self):
         """Get current joint velocities."""
-        state = self._robot.state
-        return list(state.dq)
+        return self._run_robot_call("get_joint_velocities", lambda: list(self._robot.state.dq), retries=1)
 
     def get_gripper_position(self):
         """Get gripper position (normalized 0-1, 1=open, 0=closed)."""
@@ -398,6 +481,9 @@ class FrankyRobot:
 
     def get_ee_pose(self):
         """Get end-effector pose as [position, euler_angles]."""
+        return self._run_robot_call("get_ee_pose", self._get_ee_pose_locked, retries=1)
+
+    def _get_ee_pose_locked(self):
         cartesian_state = self._robot.current_cartesian_state
         # pose is RobotPose with end_effector_pose (Affine)
         ee_pose = cartesian_state.pose.end_effector_pose
@@ -425,30 +511,32 @@ class FrankyRobot:
 
     def get_robot_state(self):
         """Get full robot state as a tuple (state_dict, timestamp_dict)."""
-        state = self._robot.state
+        def read_state():
+            state = self._robot.state
+            ee_pose = self._get_ee_pose_locked()
+            gripper_position = self.get_gripper_position()
 
-        ee_pose = self.get_ee_pose()
-        gripper_position = self.get_gripper_position()
+            state_dict = {
+                "cartesian_position": ee_pose,
+                "gripper_position": gripper_position,
+                "joint_positions": list(state.q),
+                "joint_velocities": list(state.dq),
+                "joint_torques_computed": list(state.tau_J) if hasattr(state, 'tau_J') else [0.0] * 7,
+                "prev_joint_torques_computed": list(state.tau_J) if hasattr(state, 'tau_J') else [0.0] * 7,
+                "prev_joint_torques_computed_safened": list(state.tau_J) if hasattr(state, 'tau_J') else [0.0] * 7,
+                "motor_torques_measured": list(state.tau_J) if hasattr(state, 'tau_J') else [0.0] * 7,
+                "prev_controller_latency_ms": 0,
+                "prev_command_successful": True,
+            }
 
-        state_dict = {
-            "cartesian_position": ee_pose,
-            "gripper_position": gripper_position,
-            "joint_positions": list(state.q),
-            "joint_velocities": list(state.dq),
-            "joint_torques_computed": list(state.tau_J) if hasattr(state, 'tau_J') else [0.0] * 7,
-            "prev_joint_torques_computed": list(state.tau_J) if hasattr(state, 'tau_J') else [0.0] * 7,
-            "prev_joint_torques_computed_safened": list(state.tau_J) if hasattr(state, 'tau_J') else [0.0] * 7,
-            "motor_torques_measured": list(state.tau_J) if hasattr(state, 'tau_J') else [0.0] * 7,
-            "prev_controller_latency_ms": 0,
-            "prev_command_successful": True,
-        }
+            timestamp_dict = {
+                "robot_timestamp_seconds": int(state.time.to_sec()) if hasattr(state.time, 'to_sec') else 0,
+                "robot_timestamp_nanos": 0,
+            }
 
-        timestamp_dict = {
-            "robot_timestamp_seconds": int(state.time.to_sec()) if hasattr(state.time, 'to_sec') else 0,
-            "robot_timestamp_nanos": 0,
-        }
+            return state_dict, timestamp_dict
 
-        return state_dict, timestamp_dict
+        return self._run_robot_call("get_robot_state", read_state, retries=1)
 
     def is_running_policy(self):
         """Check if robot is currently moving."""
